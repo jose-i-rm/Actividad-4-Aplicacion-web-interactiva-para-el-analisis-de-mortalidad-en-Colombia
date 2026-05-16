@@ -1,30 +1,46 @@
 """
 Aplicación web interactiva para el análisis de mortalidad en Colombia (2019).
 
+Lee directamente los archivos Excel ubicados en la raíz del proyecto:
+  - Anexo1.NoFetal2019_CE_15-03-23.xlsx
+  - Anexo2.CodigosDeMuerte_CE_15-03-23.xlsx
+  - Divipola_CE_.xlsx
+
 Autor: jose-i-rm
 Framework: Dash + Plotly
 """
 
-import base64
-import io
+from __future__ import annotations
+
 import json
+import os
 import urllib.request
+from pathlib import Path
 from typing import Optional, Tuple
 
-import dash
 import pandas as pd
 import plotly.express as px
-from dash import Dash, Input, Output, State, dash_table, dcc, html
+from dash import Dash, dash_table, dcc, html
 
 # ---------------------------------------------------------------------------
 # Configuración general
 # ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+
+# Resolución flexible: permite tanto los nombres "Anexo*..." como los nombres
+# limpios solicitados originalmente.
+DATA_FILES = {
+    "mortalidad": ["Anexo1.NoFetal2019_CE_15-03-23.xlsx", "NoFetal2019.xlsx"],
+    "codigos":    ["Anexo2.CodigosDeMuerte_CE_15-03-23.xlsx", "CodigosDeMuerte.xlsx"],
+    "divipola":   ["Divipola_CE_.xlsx", "Divipola.xlsx"],
+}
+
 GEOJSON_URL = (
     "https://raw.githubusercontent.com/caticoa3/colombia_mapa/master/"
     "co_2018_MGN_DPTO_POLITICO.geojson"
 )
 
-CIE10_HOMICIDIOS = ["X95"]  # Agresión con disparo de armas de fuego (no especificadas)
+CIE10_HOMICIDIOS = ("X95",)  # Agresión con disparo de armas de fuego (no especificadas)
 
 GRUPO_EDAD_MAP = {
     **dict.fromkeys(range(0, 5), "Mortalidad neonatal"),
@@ -41,17 +57,9 @@ GRUPO_EDAD_MAP = {
 }
 
 CICLO_ORDEN = [
-    "Mortalidad neonatal",
-    "Mortalidad infantil",
-    "Primera infancia",
-    "Niñez",
-    "Adolescencia",
-    "Juventud",
-    "Adultez temprana",
-    "Adultez intermedia",
-    "Vejez",
-    "Longevidad / Centenarios",
-    "Edad desconocida",
+    "Mortalidad neonatal", "Mortalidad infantil", "Primera infancia", "Niñez",
+    "Adolescencia", "Juventud", "Adultez temprana", "Adultez intermedia",
+    "Vejez", "Longevidad / Centenarios", "Edad desconocida",
 ]
 
 MESES_ES = {
@@ -60,27 +68,21 @@ MESES_ES = {
     9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
 }
 
-# ---------------------------------------------------------------------------
-# Inicialización de la app
-# ---------------------------------------------------------------------------
-app = Dash(__name__, suppress_callback_exceptions=True, title="Mortalidad Colombia 2019")
-server = app.server  # Exposición obligatoria para entornos de producción (gunicorn)
-
 
 # ---------------------------------------------------------------------------
-# Utilidades
+# Lectura y preparación de datos
 # ---------------------------------------------------------------------------
-def parse_uploaded_excel(contents: str) -> Optional[pd.DataFrame]:
-    """Decodifica un archivo Excel cargado vía dcc.Upload."""
-    if not contents:
-        return None
-    try:
-        _, content_string = contents.split(",")
-        decoded = base64.b64decode(content_string)
-        return pd.read_excel(io.BytesIO(decoded), engine="openpyxl")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ERROR] No se pudo leer el archivo cargado: {exc}")
-        return None
+def _resolve_file(candidates: list[str]) -> Path:
+    for name in candidates:
+        path = BASE_DIR / name
+        if path.exists():
+            return path
+        path_data = BASE_DIR / "data" / name
+        if path_data.exists():
+            return path_data
+    raise FileNotFoundError(
+        f"No se encontró ninguno de los archivos esperados: {candidates}"
+    )
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -101,10 +103,12 @@ def _find_column(df: pd.DataFrame, candidates) -> Optional[str]:
     return None
 
 
-def prepare_datasets(
-    df_mort: pd.DataFrame, df_cod: pd.DataFrame, df_divipola: pd.DataFrame
-) -> pd.DataFrame:
-    """Cruza los tres datasets y deja un DataFrame listo para los análisis."""
+def load_and_prepare() -> pd.DataFrame:
+    """Carga los tres Excel y devuelve el dataset consolidado."""
+    df_mort = pd.read_excel(_resolve_file(DATA_FILES["mortalidad"]), engine="openpyxl")
+    df_cod = pd.read_excel(_resolve_file(DATA_FILES["codigos"]), engine="openpyxl")
+    df_divipola = pd.read_excel(_resolve_file(DATA_FILES["divipola"]), engine="openpyxl")
+
     df_mort = _normalize_columns(df_mort)
     df_cod = _normalize_columns(df_cod)
     df_divipola = _normalize_columns(df_divipola)
@@ -129,17 +133,10 @@ def prepare_datasets(
     if nom_mpio: rename_dvp[nom_mpio] = "MUNICIPIO"
     df_divipola = df_divipola.rename(columns=rename_dvp)
 
-    # Normalizar códigos
     if "COD_DEPARTAMENTO" in df_divipola.columns:
-        df_divipola["COD_DEPARTAMENTO"] = (
-            pd.to_numeric(df_divipola["COD_DEPARTAMENTO"], errors="coerce")
-            .astype("Int64")
-        )
+        df_divipola["COD_DEPARTAMENTO"] = pd.to_numeric(df_divipola["COD_DEPARTAMENTO"], errors="coerce").astype("Int64")
     if "COD_MUNICIPIO" in df_divipola.columns:
-        df_divipola["COD_MUNICIPIO"] = (
-            pd.to_numeric(df_divipola["COD_MUNICIPIO"], errors="coerce")
-            .astype("Int64")
-        )
+        df_divipola["COD_MUNICIPIO"] = pd.to_numeric(df_divipola["COD_MUNICIPIO"], errors="coerce").astype("Int64")
 
     # --- Mortalidad ---
     cod_dpto_m = _find_column(df_mort, ["COD_DEPARTAMENTO", "DEPARTAMENTO", "COD_DPTO", "DPTO"])
@@ -173,21 +170,19 @@ def prepare_datasets(
             {1: "Hombre", 2: "Mujer", 3: "Indeterminado"}
         ).fillna("Indeterminado")
 
-    # Cruce con Divipola a nivel municipio (trae también departamento)
-    dvp_mpio = df_divipola.drop_duplicates(subset=["COD_MUNICIPIO"]) if "COD_MUNICIPIO" in df_divipola.columns else None
-    if dvp_mpio is not None and "COD_MUNICIPIO" in df_mort.columns:
-        df_mort = df_mort.merge(
-            dvp_mpio[[c for c in ["COD_MUNICIPIO", "MUNICIPIO", "COD_DEPARTAMENTO", "DEPARTAMENTO"] if c in dvp_mpio.columns]],
-            on="COD_MUNICIPIO",
-            how="left",
-            suffixes=("", "_DVP"),
-        )
-        if "DEPARTAMENTO_DVP" in df_mort.columns:
-            df_mort["DEPARTAMENTO"] = df_mort["DEPARTAMENTO"].fillna(df_mort["DEPARTAMENTO_DVP"]) if "DEPARTAMENTO" in df_mort.columns else df_mort["DEPARTAMENTO_DVP"]
-            df_mort = df_mort.drop(columns=["DEPARTAMENTO_DVP"])
-        if "COD_DEPARTAMENTO_DVP" in df_mort.columns:
-            df_mort["COD_DEPARTAMENTO"] = df_mort["COD_DEPARTAMENTO"].fillna(df_mort["COD_DEPARTAMENTO_DVP"])
-            df_mort = df_mort.drop(columns=["COD_DEPARTAMENTO_DVP"])
+    # Cruce con Divipola
+    if "COD_MUNICIPIO" in df_divipola.columns and "COD_MUNICIPIO" in df_mort.columns:
+        keep = [c for c in ["COD_MUNICIPIO", "MUNICIPIO", "COD_DEPARTAMENTO", "DEPARTAMENTO"] if c in df_divipola.columns]
+        dvp_mpio = df_divipola[keep].drop_duplicates(subset=["COD_MUNICIPIO"])
+        df_mort = df_mort.merge(dvp_mpio, on="COD_MUNICIPIO", how="left", suffixes=("", "_DVP"))
+        for col in ("DEPARTAMENTO", "COD_DEPARTAMENTO"):
+            dvp_col = f"{col}_DVP"
+            if dvp_col in df_mort.columns:
+                if col in df_mort.columns:
+                    df_mort[col] = df_mort[col].fillna(df_mort[dvp_col])
+                else:
+                    df_mort[col] = df_mort[dvp_col]
+                df_mort = df_mort.drop(columns=[dvp_col])
 
     # Cruce con códigos de muerte
     if "COD_CAUSA" in df_mort.columns and "COD_CAUSA" in df_cod.columns:
@@ -206,179 +201,14 @@ def _load_geojson() -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Layout
-# ---------------------------------------------------------------------------
-def upload_box(component_id: str, label: str) -> dcc.Upload:
-    return dcc.Upload(
-        id=component_id,
-        children=html.Div([html.B(label), html.Br(), "Arrastra o haz clic para cargar"]),
-        style={
-            "width": "100%", "height": "90px", "lineHeight": "20px",
-            "borderWidth": "2px", "borderStyle": "dashed", "borderRadius": "8px",
-            "textAlign": "center", "padding": "15px", "backgroundColor": "#fafafa",
-        },
-        multiple=False,
-    )
-
-
-app.layout = html.Div(
-    style={"fontFamily": "Segoe UI, Arial, sans-serif", "maxWidth": "1300px", "margin": "0 auto", "padding": "20px"},
-    children=[
-        html.H1("Análisis de Mortalidad en Colombia – 2019", style={"textAlign": "center", "color": "#003366"}),
-        html.P(
-            "Aplicación interactiva para explorar patrones demográficos y de salud pública "
-            "a partir de los datos oficiales de mortalidad del DANE.",
-            style={"textAlign": "center", "color": "#555"},
-        ),
-        html.Hr(),
-
-        html.H3("1. Carga de archivos"),
-        html.Div(
-            style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr", "gap": "15px"},
-            children=[
-                upload_box("upload-nofetal", "NoFetal2019.xlsx"),
-                upload_box("upload-codigos", "CodigosDeMuerte.xlsx"),
-                upload_box("upload-divipola", "Divipola.xlsx"),
-            ],
-        ),
-        html.Div(id="upload-status", style={"marginTop": "10px", "fontStyle": "italic"}),
-
-        dcc.Store(id="store-nofetal"),
-        dcc.Store(id="store-codigos"),
-        dcc.Store(id="store-divipola"),
-        dcc.Store(id="store-prepared"),
-
-        html.Hr(),
-        html.Div(id="dashboard-container"),
-    ],
-)
-
-
-# ---------------------------------------------------------------------------
-# Callbacks: almacenamiento de archivos cargados
-# ---------------------------------------------------------------------------
-def _store_callback(upload_id: str, store_id: str):
-    @app.callback(
-        Output(store_id, "data"),
-        Input(upload_id, "contents"),
-        State(upload_id, "filename"),
-        prevent_initial_call=True,
-    )
-    def _store(contents, filename):  # noqa: ANN001
-        df = parse_uploaded_excel(contents)
-        if df is None:
-            return dash.no_update
-        return df.to_json(date_format="iso", orient="split")
-
-
-_store_callback("upload-nofetal", "store-nofetal")
-_store_callback("upload-codigos", "store-codigos")
-_store_callback("upload-divipola", "store-divipola")
-
-
-@app.callback(
-    Output("store-prepared", "data"),
-    Output("upload-status", "children"),
-    Input("store-nofetal", "data"),
-    Input("store-codigos", "data"),
-    Input("store-divipola", "data"),
-)
-def consolidate(n_data, c_data, d_data):
-    status = []
-    status.append("NoFetal2019: " + ("✓ cargado" if n_data else "pendiente"))
-    status.append("CodigosDeMuerte: " + ("✓ cargado" if c_data else "pendiente"))
-    status.append("Divipola: " + ("✓ cargado" if d_data else "pendiente"))
-    status_text = " | ".join(status)
-
-    if not (n_data and c_data and d_data):
-        return None, status_text
-
-    try:
-        df_n = pd.read_json(io.StringIO(n_data), orient="split")
-        df_c = pd.read_json(io.StringIO(c_data), orient="split")
-        df_d = pd.read_json(io.StringIO(d_data), orient="split")
-        prepared = prepare_datasets(df_n, df_c, df_d)
-        return prepared.to_json(date_format="iso", orient="split"), status_text + " — Datos consolidados ✓"
-    except Exception as exc:  # noqa: BLE001
-        return None, f"{status_text} — Error consolidando: {exc}"
-
-
-# ---------------------------------------------------------------------------
-# Callback principal: renderiza el dashboard cuando los datos están listos
-# ---------------------------------------------------------------------------
-@app.callback(
-    Output("dashboard-container", "children"),
-    Input("store-prepared", "data"),
-)
-def render_dashboard(prepared_json):
-    if not prepared_json:
-        return html.Div(
-            "Cargue los tres archivos Excel para habilitar las visualizaciones.",
-            style={"textAlign": "center", "padding": "40px", "color": "#888"},
-        )
-
-    df = pd.read_json(io.StringIO(prepared_json), orient="split")
-
-    # 1) Mapa coroplético
-    map_fig = build_choropleth(df)
-
-    # 2) Línea: muertes por mes
-    line_fig = build_line_chart(df)
-
-    # 3) Barras: 5 ciudades más violentas (homicidios X95)
-    bar_violent_fig = build_violent_cities(df)
-
-    # 4) Circular: 10 municipios con menor mortalidad
-    pie_fig = build_lowest_cities(df)
-
-    # 5) Tabla: 10 principales causas de muerte
-    table_data, table_cols = build_top_causes(df)
-
-    # 6) Stacked bar: muertes por sexo y departamento
-    stacked_fig = build_stacked_sex(df)
-
-    # 7) Histograma por ciclo de vida
-    hist_fig = build_life_cycle(df)
-
-    section = lambda title, child: html.Div(  # noqa: E731
-        [html.H3(title, style={"color": "#003366", "marginTop": "30px"}), child]
-    )
-
-    return html.Div(
-        [
-            section("2.1 Mapa: muertes por departamento", dcc.Graph(figure=map_fig)),
-            section("2.2 Muertes totales por mes (2019)", dcc.Graph(figure=line_fig)),
-            section("2.3 5 municipios más violentos (homicidios CIE-10 X95)", dcc.Graph(figure=bar_violent_fig)),
-            section("2.4 10 municipios con menor mortalidad", dcc.Graph(figure=pie_fig)),
-            section(
-                "2.5 Top 10 causas de muerte",
-                dash_table.DataTable(
-                    data=table_data,
-                    columns=table_cols,
-                    style_cell={"textAlign": "left", "padding": "8px", "fontFamily": "Segoe UI"},
-                    style_header={"backgroundColor": "#003366", "color": "white", "fontWeight": "bold"},
-                    style_table={"overflowX": "auto"},
-                    page_size=10,
-                ),
-            ),
-            section("2.6 Muertes por sexo y departamento", dcc.Graph(figure=stacked_fig)),
-            section("2.7 Distribución por ciclo de vida (GRUPO_EDAD1)", dcc.Graph(figure=hist_fig)),
-        ]
-    )
-
-
-# ---------------------------------------------------------------------------
 # Constructores de figuras
 # ---------------------------------------------------------------------------
 def build_choropleth(df: pd.DataFrame):
     if "DEPARTAMENTO" not in df.columns:
         return px.scatter(title="Datos insuficientes para el mapa")
-
     agg = df.groupby("DEPARTAMENTO", dropna=True).size().reset_index(name="TOTAL_MUERTES")
     geojson = _load_geojson()
-
     if geojson is None:
-        # Fallback: barras horizontales por departamento
         fig = px.bar(
             agg.sort_values("TOTAL_MUERTES", ascending=True),
             x="TOTAL_MUERTES", y="DEPARTAMENTO", orientation="h",
@@ -387,17 +217,11 @@ def build_choropleth(df: pd.DataFrame):
         )
         fig.update_layout(height=700)
         return fig
-
-    # Normalización de nombres para hacer match con el geojson
     agg["DEPARTAMENTO_NORM"] = agg["DEPARTAMENTO"].str.upper().str.strip()
-
     fig = px.choropleth(
-        agg,
-        geojson=geojson,
-        locations="DEPARTAMENTO_NORM",
+        agg, geojson=geojson, locations="DEPARTAMENTO_NORM",
         featureidkey="properties.DPTO_CNMBR",
-        color="TOTAL_MUERTES",
-        color_continuous_scale="Reds",
+        color="TOTAL_MUERTES", color_continuous_scale="Reds",
         hover_name="DEPARTAMENTO",
         labels={"TOTAL_MUERTES": "Total muertes"},
     )
@@ -409,8 +233,7 @@ def build_choropleth(df: pd.DataFrame):
 def build_line_chart(df: pd.DataFrame):
     if "MES" not in df.columns:
         return px.scatter(title="Columna MES no disponible")
-    agg = df.groupby("MES").size().reset_index(name="TOTAL")
-    agg = agg.dropna(subset=["MES"]).sort_values("MES")
+    agg = df.groupby("MES").size().reset_index(name="TOTAL").dropna(subset=["MES"]).sort_values("MES")
     agg["MES_NOMBRE"] = agg["MES"].map(MESES_ES)
     fig = px.line(agg, x="MES_NOMBRE", y="TOTAL", markers=True,
                   labels={"MES_NOMBRE": "Mes", "TOTAL": "Total muertes"})
@@ -421,12 +244,11 @@ def build_line_chart(df: pd.DataFrame):
 def build_violent_cities(df: pd.DataFrame):
     if "COD_CAUSA" not in df.columns or "MUNICIPIO" not in df.columns:
         return px.scatter(title="Datos insuficientes para homicidios")
-    mask = df["COD_CAUSA"].str.startswith(tuple(CIE10_HOMICIDIOS), na=False)
+    mask = df["COD_CAUSA"].str.startswith(CIE10_HOMICIDIOS, na=False)
     sub = df[mask]
     if sub.empty:
         return px.scatter(title="No se encontraron registros para los códigos X95")
-    agg = sub.groupby("MUNICIPIO").size().reset_index(name="HOMICIDIOS")
-    agg = agg.nlargest(5, "HOMICIDIOS")
+    agg = sub.groupby("MUNICIPIO").size().reset_index(name="HOMICIDIOS").nlargest(5, "HOMICIDIOS")
     fig = px.bar(agg, x="MUNICIPIO", y="HOMICIDIOS", color="HOMICIDIOS",
                  color_continuous_scale="Reds", text="HOMICIDIOS")
     fig.update_traces(textposition="outside")
@@ -438,8 +260,7 @@ def build_lowest_cities(df: pd.DataFrame):
         return px.scatter(title="Columna MUNICIPIO no disponible")
     agg = df.groupby("MUNICIPIO").size().reset_index(name="TOTAL")
     agg = agg[agg["TOTAL"] > 0].nsmallest(10, "TOTAL")
-    fig = px.pie(agg, names="MUNICIPIO", values="TOTAL", hole=0.3)
-    return fig
+    return px.pie(agg, names="MUNICIPIO", values="TOTAL", hole=0.3)
 
 
 def build_top_causes(df: pd.DataFrame) -> Tuple[list, list]:
@@ -486,5 +307,61 @@ def build_life_cycle(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# Inicialización de la app y carga única de datos
+# ---------------------------------------------------------------------------
+app = Dash(__name__, title="Mortalidad Colombia 2019")
+server = app.server  # Exposición obligatoria para entornos de producción (gunicorn)
+
+print("[INFO] Cargando datasets…")
+DF = load_and_prepare()
+print(f"[INFO] Dataset consolidado: {len(DF):,} registros.")
+
+_table_data, _table_cols = build_top_causes(DF)
+
+
+def _section(title: str, child):
+    return html.Div([html.H3(title, style={"color": "#003366", "marginTop": "30px"}), child])
+
+
+app.layout = html.Div(
+    style={"fontFamily": "Segoe UI, Arial, sans-serif",
+           "maxWidth": "1300px", "margin": "0 auto", "padding": "20px"},
+    children=[
+        html.H1("Análisis de Mortalidad en Colombia – 2019",
+                style={"textAlign": "center", "color": "#003366"}),
+        html.P(
+            "Aplicación interactiva para explorar patrones demográficos y de salud "
+            "pública a partir de los datos oficiales de mortalidad del DANE (2019).",
+            style={"textAlign": "center", "color": "#555"},
+        ),
+        html.Hr(),
+
+        _section("1. Mapa: muertes por departamento",
+                 dcc.Graph(figure=build_choropleth(DF))),
+        _section("2. Muertes totales por mes (2019)",
+                 dcc.Graph(figure=build_line_chart(DF))),
+        _section("3. 5 municipios más violentos (homicidios CIE-10 X95)",
+                 dcc.Graph(figure=build_violent_cities(DF))),
+        _section("4. 10 municipios con menor mortalidad",
+                 dcc.Graph(figure=build_lowest_cities(DF))),
+        _section(
+            "5. Top 10 causas de muerte",
+            dash_table.DataTable(
+                data=_table_data, columns=_table_cols,
+                style_cell={"textAlign": "left", "padding": "8px", "fontFamily": "Segoe UI"},
+                style_header={"backgroundColor": "#003366", "color": "white", "fontWeight": "bold"},
+                style_table={"overflowX": "auto"},
+                page_size=10,
+            ),
+        ),
+        _section("6. Muertes por sexo y departamento",
+                 dcc.Graph(figure=build_stacked_sex(DF))),
+        _section("7. Distribución por ciclo de vida (GRUPO_EDAD1)",
+                 dcc.Graph(figure=build_life_cycle(DF))),
+    ],
+)
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 8050))
+    app.run(host="0.0.0.0", port=port, debug=True)
